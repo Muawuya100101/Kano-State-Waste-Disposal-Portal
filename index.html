@@ -16,69 +16,76 @@
         import { getFirestore, doc, addDoc, onSnapshot, collection, query, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Global variables provided by the Canvas environment
+        // Global variables provided by the Canvas environment (these will be undefined/empty on GitHub Pages)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
         let firebaseConfig;
         try {
-            firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            // Check if firebase config is provided and is valid
+            const configString = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+            firebaseConfig = JSON.parse(configString);
         } catch (e) {
             console.error("Failed to parse firebase config:", e);
             firebaseConfig = {};
         }
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        let db, auth, userId = null;
+        let db, auth, userId = 'local-user'; // Default userId for Local Storage mode
+        let useLocalStorage = false;
         let isAuthReady = false;
 
-        // Make functions accessible globally for the main script block
-        window.initFirebase = async () => {
-            if (Object.keys(firebaseConfig).length === 0) {
-                console.error("Firebase configuration is missing. Data storage will not work.");
-                document.getElementById('db-status').textContent = '⚠️ DB Unavailable (Missing Config)';
-                isAuthReady = true; // Mark ready anyway to unblock UI
-                return;
-            }
+        // --- LOCAL STORAGE FUNCTIONS (Fallback Mode) ---
 
-            try {
-                // Set Firestore log level for debugging
-                setLogLevel('Debug');
-                
-                const app = initializeApp(firebaseConfig);
-                db = getFirestore(app);
-                auth = getAuth(app);
-                window.db = db; // Attach to window for use in the main script
-
-                onAuthStateChanged(auth, async (user) => {
-                    if (user) {
-                        userId = user.uid;
-                        document.getElementById('db-status').textContent = `✅ Ready (User ID: ${userId.substring(0, 8)}...)`;
-                        isAuthReady = true;
-                        window.loadDataAndListeners(); // Load data once ready
-                    } else {
-                        // Sign in using custom token or anonymously if token is missing
-                        if (initialAuthToken) {
-                            await signInWithCustomToken(auth, initialAuthToken);
-                        } else {
-                            await signInAnonymously(auth);
-                        }
-                    }
-                });
-
-            } catch (error) {
-                console.error("Firebase initialization failed:", error);
-                document.getElementById('db-status').textContent = '❌ DB Failed to Init';
-                isAuthReady = true; // Mark ready to unblock UI
-            }
+        const getLocalSubmissions = () => {
+            const submissions = JSON.parse(localStorage.getItem('plasticSubmissions') || '[]');
+            return submissions.filter(s => s.userId === userId);
         };
 
-        window.submitPlasticReport = async (data) => {
-            if (!db || !userId) {
-                console.error("Database or User ID is not ready.");
-                document.getElementById('submission-result').textContent = 'Error: System not ready. Please try again.';
-                document.getElementById('submission-result').classList.remove('hidden');
-                return;
-            }
+        const saveLocalSubmission = (data) => {
+            const allSubmissions = JSON.parse(localStorage.getItem('plasticSubmissions') || '[]');
+            const newSubmission = { 
+                ...data, 
+                id: crypto.randomUUID(), 
+                userId: userId, 
+                timestamp: new Date().toISOString(), 
+                status: 'Confirmed', // Automatically confirm in local mode
+                reward_points: data.quantity * 10
+            };
+            allSubmissions.push(newSubmission);
+            localStorage.setItem('plasticSubmissions', JSON.stringify(allSubmissions));
+            return { success: true, id: newSubmission.id };
+        };
 
+        const setupLocalRewardsListener = (callback) => {
+            const updateRewards = () => {
+                const submissions = getLocalSubmissions();
+                let totalPoints = 0;
+                const activityLog = [];
+
+                submissions.forEach(data => {
+                    const points = data.quantity * 10;
+                    totalPoints += points;
+                    activityLog.push({
+                        date: new Date(data.timestamp).toLocaleDateString(),
+                        type: data.plasticType,
+                        quantity: data.quantity,
+                        points: points,
+                        status: data.status
+                    });
+                });
+                callback(totalPoints, activityLog);
+            };
+            
+            // Listen for changes (via a custom event)
+            window.addEventListener('localStorageUpdate', updateRewards);
+            // Initial load
+            updateRewards();
+            // Return a dummy unsubscribe function
+            return () => window.removeEventListener('localStorageUpdate', updateRewards);
+        };
+        
+        // --- FIREBASE FUNCTIONS (Primary Mode) ---
+
+        const submitToFirestore = async (data) => {
             try {
                 // Public collection for submissions, visible to all (e.g., agents/centers)
                 const collectionPath = `artifacts/${appId}/public/data/plastic_submissions`;
@@ -100,10 +107,103 @@
             }
         };
 
-        window.setupDisposalCentersListener = (callback) => {
-            if (!db || !isAuthReady) return;
+        const setupFirestoreRewardsListener = (callback) => {
+             // Private collection for user-specific rewards is hard to manage cross-app, so we use public submissions query
+            const submissionsRef = collection(db, `artifacts/${appId}/public/data/plastic_submissions`);
+            const q = query(submissionsRef, where("userId", "==", userId));
 
-            // Simple mock data for centers in a public collection
+            return onSnapshot(q, (snapshot) => {
+                let totalPoints = 0;
+                const activityLog = [];
+
+                snapshot.docs.forEach(doc => {
+                    const data = doc.data();
+                    // Simple point calculation: 10 points per item/kg
+                    // NOTE: In Firestore mode, we rely on the points being calculated server-side or after confirmation, 
+                    // but for this client-side demo, we apply the calculation here if points are zero/missing.
+                    const points = (data.reward_points > 0) ? data.reward_points : ((data.quantity || 0) * 10);
+                    totalPoints += points;
+                    activityLog.push({
+                        date: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleDateString() : 'Processing',
+                        type: data.plasticType,
+                        quantity: data.quantity,
+                        points: points,
+                        status: data.status
+                    });
+                });
+
+                callback(totalPoints, activityLog);
+            });
+        };
+
+
+        // --- MAIN INIT & DISPATCHER ---
+
+        window.initFirebase = async () => {
+            const hasFirebaseConfig = Object.keys(firebaseConfig).length > 0;
+            
+            if (!hasFirebaseConfig) {
+                useLocalStorage = true;
+                isAuthReady = true;
+                document.getElementById('db-status').textContent = '⚠️ Local Storage Mode (Offline DB)';
+                userId = 'local-user'; // Ensure ID is set for local storage
+                window.loadDataAndListeners();
+                return;
+            }
+
+            // If config is present, proceed with Firebase setup
+            try {
+                // Set Firestore log level for debugging
+                setLogLevel('Debug');
+                
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                window.db = db; // Attach to window for use in the main script
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('db-status').textContent = `✅ Firestore Ready (User ID: ${userId.substring(0, 8)}...)`;
+                        isAuthReady = true;
+                        window.loadDataAndListeners(); // Load data once ready
+                    } else {
+                        // Sign in using custom token or anonymously if token is missing
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('db-status').textContent = '❌ DB Failed to Init (Falling back to Local Storage)';
+                useLocalStorage = true;
+                isAuthReady = true;
+                userId = 'local-user';
+                window.loadDataAndListeners();
+            }
+        };
+
+        window.submitPlasticReport = async (data) => {
+            if (!isAuthReady) return { success: false, error: "System not ready. Please wait." };
+
+            if (useLocalStorage) {
+                const response = saveLocalSubmission(data);
+                // Trigger an update event for the local rewards listener
+                window.dispatchEvent(new Event('localStorageUpdate'));
+                return response;
+            } else if (db && userId) {
+                return submitToFirestore(data);
+            } else {
+                 return { success: false, error: "Authentication or Database not available." };
+            }
+        };
+
+        window.setupDisposalCentersListener = (callback) => {
+            // Centers data is static for both modes
             const centersData = [
                 { name: "Kofar Mata Recycling Hub", lat: 11.99, lon: 8.52, hours: "Mon-Sat, 8am-4pm", address: "12 Kofar Mata Rd, Kano" },
                 { name: "Sabon Gari Collection Point", lat: 12.01, lon: 8.54, hours: "24/7", address: "Opposite Post Office, Sabon Gari" },
@@ -114,36 +214,16 @@
         };
 
         window.setupRewardsListener = (callback) => {
-             if (!db || !isAuthReady || !userId) return;
+             if (!isAuthReady || !userId) return;
 
-            // Private collection for user-specific rewards
-            const rewardsRef = collection(db, `artifacts/${appId}/users/${userId}/rewards_ledger`);
-            
-            // For simplicity, we'll fetch all past submissions and calculate points client-side
-            const submissionsRef = collection(db, `artifacts/${appId}/public/data/plastic_submissions`);
-            const q = query(submissionsRef, where("userId", "==", userId));
-
-            // Listen for changes to the user's submissions to update rewards
-            return onSnapshot(q, (snapshot) => {
-                let totalPoints = 0;
-                const activityLog = [];
-
-                snapshot.docs.forEach(doc => {
-                    const data = doc.data();
-                    // Simple point calculation: 10 points per item/kg
-                    const points = (data.quantity || 0) * 10;
-                    totalPoints += points;
-                    activityLog.push({
-                        date: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleDateString() : 'Pending',
-                        type: data.plasticType,
-                        quantity: data.quantity,
-                        points: points,
-                        status: data.status
-                    });
-                });
-
-                callback(totalPoints, activityLog);
-            });
+             if (useLocalStorage) {
+                return setupLocalRewardsListener(callback);
+             } else if (db) {
+                return setupFirestoreRewardsListener(callback);
+             } else {
+                callback(0, []);
+                return () => {}; // Return dummy unsubscribe
+             }
         };
     </script>
 
@@ -231,7 +311,8 @@
                 let message = `Submission successful (ID: ${response.id.substring(0, 8)}...). You will be contacted shortly.`;
                 
                 if (submissionData.preference === 'Drop-off') {
-                    const center = window.disposalCenters[Math.floor(Math.random() * window.disposalCenters.length)];
+                    // Use a simple, non-random approach for consistency in local mode
+                    const center = window.disposalCenters[0]; 
                     message += `<br>Your nearest suggested Drop-off Center is: <strong>${center.name}</strong> (${center.address}).`;
                 } else {
                     message += `<br>Estimated collection time: **Within 24-48 hours**. Please secure your waste.`;
@@ -260,7 +341,7 @@
             window.setupDisposalCentersListener(renderDisposalCenters);
 
             // 2. Rewards Data
-            window.setupRewardsListener(renderRewards);
+            window.unsubscribeRewards = window.setupRewardsListener(renderRewards);
         };
 
         let windowWidth = window.innerWidth;
@@ -300,7 +381,7 @@
             activityContainer.innerHTML = '';
 
             if (activityLog.length === 0) {
-                 activityContainer.innerHTML = '<p class="text-gray-500 italic">No recycling activity recorded yet. Submit your first plastic report!</p>';
+                 activityContainer.innerHTML = '<p class="text-gray-500 italic p-4 text-center">No recycling activity recorded yet. Submit your first plastic report!</p>';
                  return;
             }
 
@@ -352,8 +433,7 @@
             
             <!-- Left Side: Kano State Logo -->
             <div class="flex items-center space-x-4 mb-3 md:mb-0">
-                <!-- UPDATED PATH -->
-                <img src="images/kano-logo.jpg" alt="Kano State Government Logo" class="h-12 w-12 object-contain p-0.5 bg-white rounded-full border-2 border-kano-gold">
+                <img src="images/kano-logo.jpg" alt="Kano State Government Logo" class="h-12 w-12 object-contain p-0.5 bg-white rounded-full border-2 border-kano-gold" onerror="this.onerror=null;this.src='https://placehold.co/48x48/065f46/FBBF24?text=KANO'">
                 <h1 class="text-xl font-bold text-white tracking-wider">Kano State</h1>
             </div>
 
@@ -368,8 +448,7 @@
             <!-- Right Side: School Logo -->
             <div class="flex items-center space-x-2 mt-3 md:mt-0">
                 <h2 class="text-sm font-semibold text-white">Challenge Academy</h2>
-                <!-- UPDATED PATH -->
-                <img src="images/challenge-logo.png" alt="Challenge International Academy Logo" class="h-12 w-12 object-contain p-0.5 bg-white rounded-full border-2 border-white">
+                <img src="images/challenge-logo.png" alt="Challenge International Academy Logo" class="h-12 w-12 object-contain p-0.5 bg-white rounded-full border-2 border-white" onerror="this.onerror=null;this.src='https://placehold.co/48x48/1E40AF/FFFFFF?text=CIA'">
             </div>
         </div>
 
@@ -583,7 +662,12 @@
                         <p class="font-bold text-kano-green mb-1">How I Built the Website (Technical Explanation):</p>
                         <ul class="list-disc list-inside text-gray-700 space-y-1">
                             <li>**The Code (HTML, CSS, JavaScript):** I wrote this site using **HTML** (for the structure), **Tailwind CSS** (to make it look good and work well on all phones and computers), and **JavaScript** (to make the buttons and forms work).</li>
-                            <li>**The Database (Firebase Firestore):** To make the submissions and rewards real, I used **Firebase Firestore**. This is like a secure, real-time spreadsheet on the internet that helps the system keep track of every user's recycling report and points.</li>
+                            <li>**The Database (Firebase Firestore / Local Storage):**
+                                <ul>
+                                    <li>*In the Canvas environment:* We use **Firebase Firestore** (a real-time database) to securely save data.</li>
+                                    <li>*On GitHub Pages:* The app now automatically switches to **Local Storage**. This is like a secure spreadsheet saved in your browser, allowing the submission form and rewards page to function perfectly, even without the live server connection!</li>
+                                </ul>
+                            </li>
                             <li>**Color Choice:** I chose **Dark Green** (for the environment and Kano's land), **Gold** (for value, wealth, and the recycling rewards), and **White/Blue** (our school's colors, showing innovation). These colors make it look professional and official.</li>
                         </ul>
                     </div>
